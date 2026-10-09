@@ -50,7 +50,15 @@ Scanned PDFs are kept with an `unsupported_scanned` status and a clear explanati
 
 ## Storage and migrations
 
-The SQLAlchemy models create missing tables on startup for convenient local development. Versioned SQL is also provided in `backend/migrations`. Apply it explicitly with `python backend/migrate.py`; migration `0001_initial` is idempotent and records its version in `schema_migrations`. Existing rows and uploaded files are preserved.
+The SQLAlchemy models create missing tables on startup for convenient local development. Versioned SQL is also provided in `backend/migrations`. Apply it explicitly with `python backend/migrate.py`; migrations are idempotent. Existing rows and uploaded files are preserved.
+
+## Deploy to Vercel
+
+The repository includes a Vite build and a FastAPI Python Function entry point. Before deploying, connect a Postgres database and a **private** Vercel Blob store to the Vercel project. Vercel injects the database URL and Blob credentials into the project; the backend uses Postgres for document metadata and private Blob for PDF files. It reports `deployment_ready: false` until durable database and file storage are configured. Local development continues to use SQLite and `data/uploads`.
+
+Vercel Functions accept smaller request bodies than the local API, so uploads are capped at 4 MB in production (20 MB locally). Scanned PDFs still need OCR, which is not configured. The app has no user login or per-user authorization: a public deployment is a shared workspace, and documents added there are visible to anyone who can access the API. Do not use it for confidential PDFs until authentication and document ownership are implemented.
+
+The LLM integration is optional and unused by the current extractive answer path. No OpenAI credential is needed to deploy.
 
 ## Verification
 
@@ -70,4 +78,4 @@ Tests cover upload validation and PDF delivery, page extraction and citations, a
 - Claim status uses deterministic overlap and numeric comparisons. It can miss paraphrases, negation, unit conversion, and context; it is a review aid, not a factual accuracy score.
 - OCR is not available for image-only PDFs.
 - The 3D object is an interface visualization; it does not represent document geometry or alter verification results.
-- There is no authentication or multi-user authorization. Keep the development server on a trusted local machine.
+- There is no authentication or multi-user authorization. Local development is intended for a trusted machine; a public deployment exposes a shared document library.

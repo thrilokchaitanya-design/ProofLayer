@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import uuid
 from datetime import datetime, timezone
@@ -10,7 +11,7 @@ from typing import Literal
 import fitz
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import create_engine, select, String, Text, Integer, DateTime
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
@@ -18,14 +19,22 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    database_url: str = "sqlite:///./prooflayer.db"
-    storage_dir: str = "./data/uploads"
+    database_url: str = ""
+    storage_dir: str = ""
     cors_origins: str = "http://localhost:5173"
-    max_upload_mb: int = 20
+    max_upload_mb: int = 4 if os.getenv("VERCEL") else 20
     openai_api_key: str = ""
     model_config = SettingsConfigDict(env_file="backend/.env", extra="ignore")
 
 settings = Settings()
+if not settings.database_url:
+    settings.database_url = os.getenv("POSTGRES_URL", "") or ("sqlite:////tmp/prooflayer.db" if os.getenv("VERCEL") else "sqlite:///./prooflayer.db")
+if not settings.storage_dir:
+    settings.storage_dir = "/tmp/prooflayer-uploads" if os.getenv("VERCEL") else "./data/uploads"
+if settings.database_url.startswith("postgres://"):
+    settings.database_url = settings.database_url.replace("postgres://", "postgresql+psycopg://", 1)
+elif settings.database_url.startswith("postgresql://"):
+    settings.database_url = settings.database_url.replace("postgresql://", "postgresql+psycopg://", 1)
 Path(settings.storage_dir).mkdir(parents=True, exist_ok=True)
 engine = create_engine(settings.database_url, connect_args={"check_same_thread": False} if settings.database_url.startswith("sqlite") else {})
 Session = sessionmaker(engine, expire_on_commit=False)
@@ -47,7 +56,23 @@ class Report(Base):
     question: Mapped[str] = mapped_column(Text)
     result_json: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+class DocumentFile(Base):
+    __tablename__ = "document_files"
+    document_id: Mapped[str] = mapped_column(String, primary_key=True)
+    blob_path: Mapped[str] = mapped_column(String(1024))
 Base.metadata.create_all(engine)
+
+def blob_storage_configured() -> bool:
+    return bool(os.getenv("BLOB_READ_WRITE_TOKEN") or (os.getenv("BLOB_STORE_ID") and os.getenv("VERCEL_OIDC_TOKEN")))
+
+def blob_client():
+    if not blob_storage_configured():
+        return None
+    try:
+        from vercel.blob import AsyncBlobClient
+    except ImportError as exc:
+        raise RuntimeError("Install the Vercel Python SDK to use durable PDF storage.") from exc
+    return AsyncBlobClient()
 
 app = FastAPI(title="ProofLayer API", version="1.0.0", description="Evidence grounded document question answering and claim verification.")
 app.add_middleware(CORSMiddleware, allow_origins=[x.strip() for x in settings.cors_origins.split(",")], allow_credentials=True, allow_methods=["GET", "POST", "DELETE"], allow_headers=["*"])
@@ -105,7 +130,10 @@ class ClaimIn(BaseModel):
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "llm_configured": bool(settings.openai_api_key), "answer_mode": "extractive", "database": "connected"}
+    durable_db = settings.database_url.startswith("postgresql")
+    durable_files = blob_storage_configured()
+    ready = not os.getenv("VERCEL") or (durable_db and durable_files)
+    return {"status": "ok" if ready else "degraded", "deployment_ready": ready, "llm_configured": bool(settings.openai_api_key), "answer_mode": "extractive", "database": "postgres" if durable_db else "sqlite", "pdf_storage": "vercel_blob" if durable_files else "local"}
 
 @app.post("/api/documents")
 async def upload_document(file: UploadFile = File(...)):
@@ -123,9 +151,24 @@ async def upload_document(file: UploadFile = File(...)):
         status, error = "unsupported_scanned", "No selectable text found. Scanned PDFs require OCR, which is not configured."
     else: status, error = "ready", None
     ident = str(uuid.uuid4()); safe_name = Path(file.filename or "document.pdf").name[:255]
-    Path(settings.storage_dir, ident + ".pdf").write_bytes(raw)
+    remote_file = None
+    try:
+        client = blob_client()
+        if os.getenv("VERCEL") and client is None:
+            raise HTTPException(503, "Durable PDF storage is not configured. Connect a private Vercel Blob store.")
+        if client:
+            remote_file = await client.put(f"documents/{ident}.pdf", raw, access="private", content_type="application/pdf")
+        else:
+            Path(settings.storage_dir, ident + ".pdf").write_bytes(raw)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(503, "PDF storage is unavailable. Check the connected Blob store and try again.") from exc
     with Session() as db:
-        d = Document(id=ident, name=safe_name, page_count=count, status=status, error=error, pages_json=json.dumps(pages)); db.add(d); db.commit(); db.refresh(d)
+        d = Document(id=ident, name=safe_name, page_count=count, status=status, error=error, pages_json=json.dumps(pages)); db.add(d)
+        if remote_file:
+            db.add(DocumentFile(document_id=ident, blob_path=remote_file.pathname))
+        db.commit(); db.refresh(d)
         return doc_out(d)
 
 @app.get("/api/documents")
@@ -142,21 +185,35 @@ def get_document(document_id: str):
         return {**doc_out(d), "pages": json.loads(d.pages_json)}
 
 @app.get("/api/documents/{document_id}/file")
-def get_document_file(document_id: str):
+async def get_document_file(document_id: str):
     with Session() as db:
         d = db.get(Document, document_id)
         if not d: raise HTTPException(404, "Document not found.")
-        path = Path(settings.storage_dir, f"{d.id}.pdf")
-        if not path.is_file(): raise HTTPException(404, "The stored PDF file is unavailable.")
-        return FileResponse(
-            path,
+        remote = db.get(DocumentFile, document_id)
+        blob_path = remote.blob_path if remote else None
+    if blob_path:
+        try:
+            result = await blob_client().get(blob_path, access="private")
+        except Exception as exc:
+            raise HTTPException(503, "PDF storage is unavailable.") from exc
+        if result is None or result.status_code != 200:
+            raise HTTPException(404, "The stored PDF file is unavailable.")
+        return StreamingResponse(
+            result.stream,
             media_type="application/pdf",
-            headers={
-                "Content-Disposition": f'inline; filename="{d.id}.pdf"',
-                "Cache-Control": "private, no-store",
-                "X-Content-Type-Options": "nosniff",
-            },
+            headers={"Content-Disposition": f'inline; filename="{d.id}.pdf"', "Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff"},
         )
+    path = Path(settings.storage_dir, f"{d.id}.pdf")
+    if not path.is_file(): raise HTTPException(404, "The stored PDF file is unavailable.")
+    return FileResponse(
+        path,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'inline; filename="{d.id}.pdf"',
+            "Cache-Control": "private, no-store",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
 
 @app.get("/api/documents/{document_id}/pages/{page_number}")
 def get_page(document_id: str, page_number: int):
@@ -165,12 +222,20 @@ def get_page(document_id: str, page_number: int):
     return pages[page_number-1]
 
 @app.delete("/api/documents/{document_id}")
-def delete_document(document_id: str):
+async def delete_document(document_id: str):
     with Session() as db:
         d = db.get(Document, document_id)
         if not d: raise HTTPException(404, "Document not found.")
-        try: Path(settings.storage_dir, d.id + ".pdf").unlink(missing_ok=True)
-        except OSError: pass
+        stored_file = db.get(DocumentFile, document_id)
+        if stored_file:
+            try:
+                await blob_client().delete([stored_file.blob_path])
+            except Exception as exc:
+                raise HTTPException(503, "PDF storage is unavailable; document was not deleted.") from exc
+            db.delete(stored_file)
+        else:
+            try: Path(settings.storage_dir, d.id + ".pdf").unlink(missing_ok=True)
+            except OSError: pass
         db.query(Report).filter_by(document_id=document_id).delete(); db.delete(d); db.commit()
         return {"deleted": True}
 
