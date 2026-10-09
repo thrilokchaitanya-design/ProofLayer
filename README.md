@@ -54,7 +54,7 @@ The SQLAlchemy models create missing tables on startup for convenient local deve
 
 ## Deploy to Vercel
 
-The repository includes a Vite build and a FastAPI Python Function entry point. Before deploying, connect a Postgres database and a **private** Vercel Blob store to the Vercel project. Vercel injects the database URL and Blob credentials into the project; the backend uses Postgres for document metadata and private Blob for PDF files. It reports `deployment_ready: false` until durable database and file storage are configured. Local development continues to use SQLite and `data/uploads`.
+The repository uses Vercel Services to build the Vite frontend and FastAPI backend separately, routing `/api/*` to FastAPI. Set the Vercel project's framework preset to **Services** before its first deployment with this configuration. Connect a Postgres database and a **private** Vercel Blob store to the Vercel project. Vercel injects the database URL and Blob credentials into the project; the backend uses Postgres for document metadata and private Blob for PDF files. It reports `deployment_ready: false` until durable database and file storage are configured. Local development continues to use SQLite and `data/uploads`.
 
 Vercel Functions accept smaller request bodies than the local API, so uploads are capped at 4 MB in production (20 MB locally). Scanned PDFs still need OCR, which is not configured. The app has no user login or per-user authorization: a public deployment is a shared workspace, and documents added there are visible to anyone who can access the API. Do not use it for confidential PDFs until authentication and document ownership are implemented.
 
